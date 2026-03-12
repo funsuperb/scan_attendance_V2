@@ -396,10 +396,10 @@
 
   // ===== Load DB =====
   async function loadFaceDatabase() {
-    mainStatus.innerText = '3/4 โหลดฐานข้อมูลพนักงาน...';
+    mainStatus.innerText = '3/4 โหลดฐานข้อมูลนักศึกษาแพทย์...';
     try {
       const data = await fetch(API_URL + '?action=getKnownFaces').then(r => r.json());
-      if (!data || data.length === 0) return showError('ไม่พบข้อมูลพนักงาน กรุณาลงทะเบียนก่อน');
+      if (!data || data.length === 0) return showError('ไม่พบข้อมูลนักศึกษาแพทย์ กรุณาลงทะเบียนก่อน');
 
       knownFaces = data.map(u => ({
         name: u.label,
@@ -479,7 +479,7 @@
 
     const now = new Date();
     const timeStr = now.toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
-    document.getElementById('modalTime').innerText  = 'เวลาเข้างาน: ' + timeStr + ' น.';
+    document.getElementById('modalTime').innerText  = 'เวลาเข้าปฏิบัติงาน: ' + timeStr + ' น.';
 
     const pct = ((1 - match.distance) * 100).toFixed(1);
     document.getElementById('modalScore').innerText = 'ความเหมือน: ' + pct + '%';
