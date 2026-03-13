@@ -320,6 +320,12 @@
   const LIVENESS_MIN_MOVE_PX     = 12;   // ระยะขยับขั้นต่ำของจุดศูนย์กลางใบหน้า (pixel)
   const LIVENESS_MIN_SCALE_DIFF  = 0.10; // เปลี่ยนขนาดกรอบใบหน้าอย่างน้อยกี่ % จึงนับเป็น movement
 
+  // liveness เพิ่มเติม: ให้ทำท่าทาง + กะพริบตา
+  const CHALLENGE_TIMEOUT_MS   = 8000;   // หมดเวลาคำสั่งท่าทาง 1 ครั้ง แล้วสุ่มใหม่
+  const REQUIRED_BLINKS        = 1;      // ต้องกะพริบตาอย่างน้อยกี่ครั้ง
+  const BLINK_EAR_THRESHOLD    = 0.22;   // eye aspect ratio ต่ำกว่านี้ถือว่าปิดตา
+  const BLINK_MIN_FRAMES       = 2;      // EAR ต่ำติดกันอย่างน้อยกี่เฟรมจึงนับเป็น 1 blink
+
   let knownFaces   = [];
   let scanInterval = null;
   let currentMatch = null;
@@ -329,6 +335,11 @@
     lastBox: null,
     lastEventTime: null,
     events: 0
+  };
+  let livenessChallenge = null; // { type: 'TURN_LEFT' | 'TURN_RIGHT', createdAt: number, satisfied: bool }
+  let blinkState = {
+    earBelowFrames: 0,
+    blinkCount: 0
   };
 
   // ===== Init =====
@@ -455,6 +466,8 @@
 
     // รีเซ็ตสถานะ liveness ทุกครั้งที่เริ่มสแกนใหม่
     livenessState = { lastBox: null, lastEventTime: null, events: 0 };
+    livenessChallenge = null;
+    blinkState = { earBelowFrames: 0, blinkCount: 0 };
 
     scanInterval = setInterval(async () => {
       if (video.paused || video.ended) return;
@@ -465,10 +478,39 @@
         .withFaceDescriptor();
 
       if (detection) {
-        const isLive = updateLiveness(detection.detection.box);
+        const box = detection.detection.box;
+        const landmarks = detection.landmarks;
 
-        if (!isLive) {
-          overlayStatus.innerText = 'ขยับหน้า/ก้มเงยเล็กน้อย เพื่อตรวจสอบว่าไม่ใช่รูปภาพ';
+        // สร้าง challenge ท่าทางแบบสุ่ม (หันซ้าย/ขวา) ถ้ายังไม่มี
+        if (!livenessChallenge) {
+          livenessChallenge = createRandomChallenge();
+        } else {
+          // ถ้าคำสั่งเก่าใช้เวลานานเกินไปให้สุ่มใหม่
+          const now = Date.now();
+          if (now - livenessChallenge.createdAt > CHALLENGE_TIMEOUT_MS && !livenessChallenge.satisfied) {
+            livenessChallenge = createRandomChallenge();
+          }
+        }
+
+        const motionLive   = updateLiveness(box);
+        const blinkLive    = updateBlinkState(landmarks);
+        const poseLive     = checkPoseChallenge(landmarks, livenessChallenge);
+
+        // แสดงข้อความนำทางลำดับความสำคัญ: ท่าทาง -> กะพริบตา -> ขยับหน้า
+        if (!poseLive) {
+          overlayStatus.innerText = getChallengeMessage(livenessChallenge);
+          overlayStatus.style.background = 'rgba(59,130,246,0.75)'; // ฟ้า: ทำตามคำสั่ง
+          return;
+        }
+
+        if (!blinkLive) {
+          overlayStatus.innerText = 'กรุณากะพริบตาหนึ่งครั้ง เพื่อยืนยันว่าเป็นใบหน้าจริง';
+          overlayStatus.style.background = 'rgba(59,130,246,0.75)';
+          return;
+        }
+
+        if (!motionLive) {
+          overlayStatus.innerText = 'ขยับหน้า/ก้มเงยเล็กน้อย เพื่อตรวจสอบว่าไม่ใช่รูปภาพนิ่ง';
           overlayStatus.style.background = 'rgba(234,179,8,0.7)';
           return;
         }
@@ -609,6 +651,110 @@
     }
 
     return livenessState.events >= LIVENESS_REQUIRED_EVENTS;
+  }
+
+  // random ท่าทางหันซ้าย/ขวา
+  function createRandomChallenge() {
+    const types = ['TURN_LEFT', 'TURN_RIGHT'];
+    const type = types[Math.floor(Math.random() * types.length)];
+    return {
+      type,
+      createdAt: Date.now(),
+      satisfied: false
+    };
+  }
+
+  function getChallengeMessage(challenge) {
+    if (!challenge) return 'มองกล้องตรง ๆ';
+    if (challenge.type === 'TURN_LEFT') {
+      return 'กรุณาหันหน้าไปทางซ้ายช้า ๆ แล้วค้างไว้ชั่วครู่';
+    }
+    if (challenge.type === 'TURN_RIGHT') {
+      return 'กรุณาหันหน้าไปทางขวาช้า ๆ แล้วค้างไว้ชั่วครู่';
+    }
+    return 'มองกล้องตรง ๆ';
+  }
+
+  // เช็คว่าทำท่าทางตาม challenge หรือยัง (ใช้ตำแหน่งจมูกเทียบกับตาทั้งสองข้าง)
+  function checkPoseChallenge(landmarks, challenge) {
+    if (!challenge || challenge.satisfied) return true;
+    if (!landmarks) return false;
+
+    const leftEye  = landmarks.getLeftEye();
+    const rightEye = landmarks.getRightEye();
+    const nose     = landmarks.getNose();
+    if (!leftEye.length || !rightEye.length || !nose.length) return false;
+
+    const eyeCenterX = (leftEye[0].x + rightEye[rightEye.length - 1].x) / 2;
+    const nosePoint  = nose[Math.floor(nose.length / 2)];
+    const diffX      = nosePoint.x - eyeCenterX;
+
+    // เพราะเรากลับภาพด้วย scaleX(-1) ทิศทางจะกลับด้าน
+    const TURN_OFFSET_PX = 10;
+
+    if (challenge.type === 'TURN_LEFT') {
+      // ผู้ใช้หันหน้าไปทางซ้ายของตัวเอง -> ในภาพ (ที่กลับแล้ว) จมูกจะขยับไปทางขวา
+      if (diffX > TURN_OFFSET_PX) {
+        challenge.satisfied = true;
+        return true;
+      }
+      return false;
+    }
+
+    if (challenge.type === 'TURN_RIGHT') {
+      // ผู้ใช้หันหน้าไปทางขวาของตัวเอง -> ในภาพ (ที่กลับแล้ว) จมูกจะขยับไปทางซ้าย
+      if (diffX < -TURN_OFFSET_PX) {
+        challenge.satisfied = true;
+        return true;
+      }
+      return false;
+    }
+
+    return true;
+  }
+
+  // ตรวจจับการกะพริบตาจาก eye aspect ratio
+  function updateBlinkState(landmarks) {
+    if (!landmarks) return false;
+
+    const leftEye  = landmarks.getLeftEye();
+    const rightEye = landmarks.getRightEye();
+    if (!leftEye.length || !rightEye.length) return false;
+
+    const earLeft  = computeEAR(leftEye);
+    const earRight = computeEAR(rightEye);
+    const ear = (earLeft + earRight) / 2;
+
+    if (ear < BLINK_EAR_THRESHOLD) {
+      blinkState.earBelowFrames += 1;
+    } else {
+      if (blinkState.earBelowFrames >= BLINK_MIN_FRAMES) {
+        blinkState.blinkCount += 1;
+      }
+      blinkState.earBelowFrames = 0;
+    }
+
+    return blinkState.blinkCount >= REQUIRED_BLINKS;
+  }
+
+  function computeEAR(eyePoints) {
+    // ใช้สูตร EAR แบบมาตรฐาน จาก 6 จุดของตา
+    // p1-p6 เรียงตามจุดรอบดวงตา
+    const p1 = eyePoints[0];
+    const p2 = eyePoints[1];
+    const p3 = eyePoints[2];
+    const p4 = eyePoints[3];
+    const p5 = eyePoints[4];
+    const p6 = eyePoints[5];
+
+    const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+    const vertical1 = dist(p2, p6);
+    const vertical2 = dist(p3, p5);
+    const horizontal = dist(p1, p4);
+
+    if (horizontal === 0) return 0;
+    return (vertical1 + vertical2) / (2.0 * horizontal);
   }
 </script>
 </body>
