@@ -313,11 +313,23 @@
 
   const MATCH_THRESHOLD = 0.45;
 
+  // ===== Anti-spoofing (liveness) config =====
+  // เน้นกันการใช้ภาพนิ่ง: ต้องมีการขยับใบหน้าเล็กน้อยหลายครั้งก่อนยอมให้สแกนผ่าน
+  const LIVENESS_REQUIRED_EVENTS = 3;    // ต้องตรวจพบ movement อย่างน้อยกี่ครั้ง
+  const LIVENESS_MAX_IDLE_MS     = 4000; // ถ้าไม่มี movement นานเกินกี่ ms ให้รีเซ็ต
+  const LIVENESS_MIN_MOVE_PX     = 12;   // ระยะขยับขั้นต่ำของจุดศูนย์กลางใบหน้า (pixel)
+  const LIVENESS_MIN_SCALE_DIFF  = 0.10; // เปลี่ยนขนาดกรอบใบหน้าอย่างน้อยกี่ % จึงนับเป็น movement
+
   let knownFaces   = [];
   let scanInterval = null;
   let currentMatch = null;
   let currentLat   = null;
   let currentLng   = null;
+  let livenessState = {
+    lastBox: null,
+    lastEventTime: null,
+    events: 0
+  };
 
   // ===== Init =====
   if (!API_URL) {
@@ -441,6 +453,9 @@
     overlayStatus.innerText     = 'มองกล้องเพื่อสแกน';
     overlayStatus.style.background = 'rgba(0,0,0,0.65)';
 
+    // รีเซ็ตสถานะ liveness ทุกครั้งที่เริ่มสแกนใหม่
+    livenessState = { lastBox: null, lastEventTime: null, events: 0 };
+
     scanInterval = setInterval(async () => {
       if (video.paused || video.ended) return;
 
@@ -450,6 +465,14 @@
         .withFaceDescriptor();
 
       if (detection) {
+        const isLive = updateLiveness(detection.detection.box);
+
+        if (!isLive) {
+          overlayStatus.innerText = 'ขยับหน้า/ก้มเงยเล็กน้อย เพื่อตรวจสอบว่าไม่ใช่รูปภาพ';
+          overlayStatus.style.background = 'rgba(234,179,8,0.7)';
+          return;
+        }
+
         const best = findBestMatch(detection.descriptor);
         if (best.distance < MATCH_THRESHOLD) {
           clearInterval(scanInterval);
@@ -542,6 +565,51 @@
   }
 
   function deg2rad(deg) { return deg * Math.PI / 180; }
+
+  // ===== Anti-spoofing helpers =====
+  function updateLiveness(box) {
+    const now = Date.now();
+
+    // ถ้านานเกินกำหนดให้รีเซ็ตเหตุการณ์
+    if (livenessState.lastEventTime && (now - livenessState.lastEventTime > LIVENESS_MAX_IDLE_MS)) {
+      livenessState.events = 0;
+      livenessState.lastBox = null;
+      livenessState.lastEventTime = now;
+    }
+
+    const cx = box.x + box.width / 2;
+    const cy = box.y + box.height / 2;
+    const area = box.width * box.height;
+
+    if (!livenessState.lastBox) {
+      livenessState.lastBox = { cx, cy, area };
+      livenessState.lastEventTime = now;
+      return false;
+    }
+
+    const dx = cx - livenessState.lastBox.cx;
+    const dy = cy - livenessState.lastBox.cy;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    const lastArea = livenessState.lastBox.area || 1;
+    const scaleDiff = Math.abs(area - lastArea) / lastArea;
+
+    let moved = false;
+    if (dist > LIVENESS_MIN_MOVE_PX || scaleDiff > LIVENESS_MIN_SCALE_DIFF) {
+      moved = true;
+      livenessState.events += 1;
+      livenessState.lastEventTime = now;
+      livenessState.lastBox = { cx, cy, area };
+    }
+
+    // เพิ่มการค่อย ๆ ลดย้อนกลับนิดหน่อย ถ้าไม่มี movement เลย
+    if (!moved && livenessState.events > 0 && now - livenessState.lastEventTime > 1000) {
+      livenessState.events = Math.max(0, livenessState.events - 1);
+      livenessState.lastEventTime = now;
+    }
+
+    return livenessState.events >= LIVENESS_REQUIRED_EVENTS;
+  }
 </script>
 </body>
 </html>
