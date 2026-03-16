@@ -302,47 +302,32 @@
 </div>
 
 <script>
-  const API_URL        = localStorage.getItem('gasApiUrl') || GAS_API_URL;
-  const video          = document.getElementById('video');
-  const mainStatus     = document.getElementById('main-status');
-  const overlayStatus  = document.getElementById('overlay-status');
-  const confirmModal   = document.getElementById('confirmModal');
-  const gpsStatus      = document.getElementById('gps-status');
-  const gpsAlertBox    = document.getElementById('gps-alert-box');
-  const btnStart       = document.getElementById('btnStart');
+const API_URL = localStorage.getItem('gasApiUrl') || (typeof GAS_API_URL !== 'undefined' ? GAS_API_URL : null);
+  const video = document.getElementById('video');
+  const mainStatus = document.getElementById('main-status');
+  const overlayStatus = document.getElementById('overlay-status');
+  const confirmModal = document.getElementById('confirmModal');
+  const gpsStatus = document.getElementById('gps-status');
+  const gpsAlertBox = document.getElementById('gps-alert-box');
+  const btnStart = document.getElementById('btnStart');
 
+  // ===== Anti-spoofing Configuration =====
   const MATCH_THRESHOLD = 0.45;
-
-  // ===== Anti-spoofing (liveness) config =====
-  // เน้นกันการใช้ภาพนิ่ง: ต้องมีการขยับใบหน้าเล็กน้อยหลายครั้งก่อนยอมให้สแกนผ่าน
-  const LIVENESS_REQUIRED_EVENTS = 3;    // ต้องตรวจพบ movement อย่างน้อยกี่ครั้ง
-  const LIVENESS_MAX_IDLE_MS     = 4000; // ถ้าไม่มี movement นานเกินกี่ ms ให้รีเซ็ต
-  const LIVENESS_MIN_MOVE_PX     = 12;   // ระยะขยับขั้นต่ำของจุดศูนย์กลางใบหน้า (pixel)
-  const LIVENESS_MIN_SCALE_DIFF  = 0.10; // เปลี่ยนขนาดกรอบใบหน้าอย่างน้อยกี่ % จึงนับเป็น movement
-
-  // liveness เพิ่มเติม: ให้ทำท่าทาง + กะพริบตา
-  const CHALLENGE_TIMEOUT_MS   = 8000;   // หมดเวลาคำสั่งท่าทาง 1 ครั้ง แล้วสุ่มใหม่
-  const REQUIRED_BLINKS        = 1;      // ต้องกะพริบตาอย่างน้อยกี่ครั้ง
-  const BLINK_EAR_THRESHOLD    = 0.22;   // eye aspect ratio ต่ำกว่านี้ถือว่าปิดตา
-  const BLINK_MIN_FRAMES       = 2;      // EAR ต่ำติดกันอย่างน้อยกี่เฟรมจึงนับเป็น 1 blink
-
-  let knownFaces   = [];
+  const BLINK_THRESHOLD = 0.22; // ค่า EAR ต่ำกว่านี้ถือว่าหลับตา
+  const LIVENESS_REQUIRED_MOVES = 2; // จำนวนครั้งที่ต้องขยับหน้า
+  
+  let knownFaces = [];
   let scanInterval = null;
   let currentMatch = null;
-  let currentLat   = null;
-  let currentLng   = null;
-  let livenessState = {
-    lastBox: null,
-    lastEventTime: null,
-    events: 0
-  };
-  let livenessChallenge = null; // { type: 'TURN_LEFT' | 'TURN_RIGHT', createdAt: number, satisfied: bool }
-  let blinkState = {
-    earBelowFrames: 0,
-    blinkCount: 0
-  };
+  let currentLat = null;
+  let currentLng = null;
+  
+  // สถานะสำหรับการตรวจสอบ Liveness
+  let hasBlinked = false;
+  let movementEvents = 0;
+  let lastBox = null;
 
-  // ===== Init =====
+  // ===== Initialization =====
   if (!API_URL) {
     showError('ยังไม่ได้ตั้งค่า API URL — <a href="config.html" style="color:#fbbf24">ไปตั้งค่า</a>');
   } else {
@@ -358,7 +343,7 @@
     }
   }
 
-  // ===== GPS =====
+  // ===== GPS System =====
   function checkGPS() {
     return new Promise((resolve, reject) => {
       if (!navigator.geolocation) {
@@ -383,11 +368,11 @@
             const dist = haversineKm(currentLat, currentLng, config.lat, config.lng);
 
             if (dist <= config.radius) {
-              gpsStatus.innerHTML = '<span style="color:#34d399">📍 GPS: OK (ห่างเป้าหมาย ' + dist.toFixed(3) + ' km)</span>';
+              gpsStatus.innerHTML = '<span style="color:#34d399">📍 GPS: OK (ห่าง ' + dist.toFixed(3) + ' km)</span>';
               resolve();
               initFaceSystem();
             } else {
-              gpsStatus.innerHTML = '<span style="color:#f87171">📍 GPS: ห่างเกินไป (' + dist.toFixed(3) + ' km / กำหนด ' + config.radius + ' km)</span>';
+              gpsStatus.innerHTML = '<span style="color:#f87171">📍 GPS: ห่างเกินไป (' + dist.toFixed(3) + ' km)</span>';
               gpsAlertBox.style.display = 'block';
               mainStatus.innerText = '⛔ ไม่อนุญาตให้สแกน';
               overlayStatus.innerText = 'Out of Range';
@@ -401,7 +386,7 @@
     });
   }
 
-  // ===== Load AI =====
+  // ===== Load AI & Database =====
   async function initFaceSystem() {
     mainStatus.innerText = '2/4 โหลด AI Model...';
     const MODEL_URL = 'https://justadudewhohacks.github.io/face-api.js/models';
@@ -417,38 +402,35 @@
     }
   }
 
-  // ===== Load DB =====
   async function loadFaceDatabase() {
-    mainStatus.innerText = '3/4 โหลดฐานข้อมูลนักศึกษาแพทย์...';
+    mainStatus.innerText = '3/4 โหลดฐานข้อมูล...';
     try {
       const data = await fetch(API_URL + '?action=getKnownFaces').then(r => r.json());
-      if (!data || data.length === 0) return showError('ไม่พบข้อมูลนักศึกษาแพทย์ กรุณาลงทะเบียนก่อน');
+      if (!data || data.length === 0) return showError('ไม่พบข้อมูลผู้ใช้ในระบบ');
 
       knownFaces = data.map(u => ({
         name: u.label,
         descriptor: new Float32Array(u.descriptor)
       }));
 
-      mainStatus.innerText    = '✅ ระบบพร้อมใช้งาน';
-      mainStatus.style.color  = '#34d399';
-      btnStart.style.display  = 'inline-block';
+      mainStatus.innerText = '✅ ระบบพร้อมใช้งาน';
+      mainStatus.style.color = '#34d399';
+      btnStart.style.display = 'inline-block';
     } catch (e) {
       showError('โหลดฐานข้อมูลล้มเหลว: ' + e.message);
     }
   }
 
-  // ===== Camera =====
+  // ===== Camera Control =====
   function startCamera() {
     btnStart.style.display = 'none';
-    mainStatus.innerText   = 'กำลังเปิดกล้อง...';
-    mainStatus.style.color = '#94a3b8';
-
+    mainStatus.innerText = 'กำลังเปิดกล้อง...';
+    
     navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } })
       .then(stream => {
         video.srcObject = stream;
         video.classList.add('active');
-        mainStatus.innerText   = '✅ กำลังสแกน...';
-        mainStatus.style.color = '#34d399';
+        mainStatus.innerText = '✅ กำลังสแกน...';
         document.getElementById('scanLine').classList.add('active');
         startScanLoop();
       })
@@ -458,16 +440,15 @@
       });
   }
 
-  // ===== Scan Loop =====
+  // ===== Main Scanning Logic (With Anti-Spoofing) =====
   function startScanLoop() {
     if (scanInterval) clearInterval(scanInterval);
-    overlayStatus.innerText     = 'มองกล้องเพื่อสแกน';
-    overlayStatus.style.background = 'rgba(0,0,0,0.65)';
-
-    // รีเซ็ตสถานะ liveness ทุกครั้งที่เริ่มสแกนใหม่
-    livenessState = { lastBox: null, lastEventTime: null, events: 0 };
-    livenessChallenge = null;
-    blinkState = { earBelowFrames: 0, blinkCount: 0 };
+    
+    // Reset Liveness State
+    hasBlinked = false;
+    movementEvents = 0;
+    lastBox = null;
+    overlayStatus.innerText = 'กรุณามองกล้อง';
 
     scanInterval = setInterval(async () => {
       if (video.paused || video.ended) return;
@@ -478,54 +459,66 @@
         .withFaceDescriptor();
 
       if (detection) {
-        const box = detection.detection.box;
         const landmarks = detection.landmarks;
+        const box = detection.detection.box;
 
-        // สร้าง challenge ท่าทางแบบสุ่ม (หันซ้าย/ขวา) ถ้ายังไม่มี
-        if (!livenessChallenge) {
-          livenessChallenge = createRandomChallenge();
-        } else {
-          // ถ้าคำสั่งเก่าใช้เวลานานเกินไปให้สุ่มใหม่
-          const now = Date.now();
-          if (now - livenessChallenge.createdAt > CHALLENGE_TIMEOUT_MS && !livenessChallenge.satisfied) {
-            livenessChallenge = createRandomChallenge();
+        // 1. ตรวจสอบการกะพริบตา (Blink Detection)
+        const leftEye = landmarks.getLeftEye();
+        const rightEye = landmarks.getRightEye();
+        const avgEAR = (getEAR(leftEye) + getEAR(rightEye)) / 2;
+
+        if (avgEAR < BLINK_THRESHOLD) {
+          hasBlinked = true;
+        }
+
+        // 2. ตรวจสอบการขยับใบหน้า (Motion Detection)
+        if (lastBox) {
+          const currentCenterX = box.x + box.width / 2;
+          const lastCenterX = lastBox.x + lastBox.width / 2;
+          if (Math.abs(currentCenterX - lastCenterX) > 8) {
+            movementEvents++;
           }
         }
+        lastBox = box;
 
-        const motionLive   = updateLiveness(box);
-        const blinkLive    = updateBlinkState(landmarks);
-        const poseLive     = checkPoseChallenge(landmarks, livenessChallenge);
-
-        // แสดงข้อความนำทางลำดับความสำคัญ: ท่าทาง -> กะพริบตา -> ขยับหน้า
-        if (!poseLive) {
-          overlayStatus.innerText = getChallengeMessage(livenessChallenge);
-          overlayStatus.style.background = 'rgba(59,130,246,0.75)'; // ฟ้า: ทำตามคำสั่ง
+        // --- เช็คเงื่อนไขความปลอดภัยก่อนสแกนชื่อ ---
+        if (!hasBlinked) {
+          overlayStatus.innerText = '⚠️ โปรดกะพริบตา 1 ครั้ง';
+          overlayStatus.style.background = 'rgba(59, 130, 246, 0.7)';
           return;
         }
 
-        if (!blinkLive) {
-          overlayStatus.innerText = 'กรุณากะพริบตาหนึ่งครั้ง เพื่อยืนยันว่าเป็นใบหน้าจริง';
-          overlayStatus.style.background = 'rgba(59,130,246,0.75)';
+        if (movementEvents < LIVENESS_REQUIRED_MOVES) {
+          overlayStatus.innerText = '⚠️ โปรดขยับหน้าเล็กน้อย';
+          overlayStatus.style.background = 'rgba(234, 179, 8, 0.7)';
           return;
         }
 
-        if (!motionLive) {
-          overlayStatus.innerText = 'ขยับหน้า/ก้มเงยเล็กน้อย เพื่อตรวจสอบว่าไม่ใช่รูปภาพนิ่ง';
-          overlayStatus.style.background = 'rgba(234,179,8,0.7)';
-          return;
-        }
-
+        // 3. เปรียบเทียบใบหน้า (Recognition)
+        overlayStatus.innerText = 'กำลังตรวจสอบใบหน้า...';
+        overlayStatus.style.background = 'rgba(16, 185, 129, 0.7)';
+        
         const best = findBestMatch(detection.descriptor);
         if (best.distance < MATCH_THRESHOLD) {
           clearInterval(scanInterval);
           document.getElementById('scanLine').classList.remove('active');
           showModal(best);
         } else {
-          overlayStatus.innerText            = 'ไม่รู้จัก (' + best.distance.toFixed(2) + ')';
-          overlayStatus.style.background     = 'rgba(239,68,68,0.6)';
+          overlayStatus.innerText = 'ไม่รู้จัก (' + ((1-best.distance)*100).toFixed(0) + '%)';
+          overlayStatus.style.background = 'rgba(239, 68, 68, 0.6)';
         }
       }
     }, 500);
+  }
+
+  // ===== Helper Functions =====
+
+  // คำนวณความเปิด-ปิดของตา (Eye Aspect Ratio)
+  function getEAR(eye) {
+    const d1 = Math.sqrt(Math.pow(eye[1].x - eye[5].x, 2) + Math.pow(eye[1].y - eye[5].y, 2));
+    const d2 = Math.sqrt(Math.pow(eye[2].x - eye[4].x, 2) + Math.pow(eye[2].y - eye[4].y, 2));
+    const d3 = Math.sqrt(Math.pow(eye[0].x - eye[3].x, 2) + Math.pow(eye[0].y - eye[3].y, 2));
+    return (d1 + d2) / (2.0 * d3);
   }
 
   function findBestMatch(queryDesc) {
@@ -537,27 +530,19 @@
     return best;
   }
 
-  // ===== Modal =====
   function showModal(match) {
     currentMatch = match.name;
-    document.getElementById('modalName').innerText  = match.name;
-
+    document.getElementById('modalName').innerText = match.name;
     const now = new Date();
     const timeStr = now.toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
-    document.getElementById('modalTime').innerText  = 'เวลาเข้าปฏิบัติงาน: ' + timeStr + ' น.';
-
-    const pct = ((1 - match.distance) * 100).toFixed(1);
-    document.getElementById('modalScore').innerText = 'ความเหมือน: ' + pct + '%';
-
+    document.getElementById('modalTime').innerText = 'เวลา Clock In: ' + timeStr + ' น.';
     confirmModal.style.display = 'flex';
-    mainStatus.innerText = 'กรุณายืนยัน...';
   }
 
   async function confirmAttendance() {
     const btn = document.getElementById('btnConfirm');
-    btn.disabled   = true;
-    btn.innerText  = 'กำลังบันทึก...';
-
+    btn.disabled = true;
+    btn.innerText = 'กำลังบันทึก...';
     try {
       const res = await fetch(API_URL, {
         method: 'POST',
@@ -568,7 +553,7 @@
       window.location.href = 'index.html';
     } catch (e) {
       alert('❌ บันทึกล้มเหลว: ' + e.message);
-      btn.disabled  = false;
+      btn.disabled = false;
       btn.innerText = '✅ ยืนยัน Clock In';
     }
   }
@@ -576,33 +561,19 @@
   function cancelAttendance() {
     confirmModal.style.display = 'none';
     currentMatch = null;
-    if (scanInterval) clearInterval(scanInterval);
-
-    if (video.srcObject) {
-      video.srcObject.getTracks().forEach(t => t.stop());
-      video.srcObject = null;
-    }
-    video.classList.remove('active');
-    document.getElementById('scanLine').classList.remove('active');
-
-    mainStatus.innerText    = '✅ ระบบพร้อมใช้งาน';
-    mainStatus.style.color  = '#34d399';
-    overlayStatus.innerText = 'รอโหลด...';
-    overlayStatus.style.background = 'rgba(0,0,0,0.65)';
-    btnStart.style.display  = 'inline-block';
+    startScanLoop(); // เริ่มสแกนใหม่
   }
 
-  // ===== Helpers =====
   function showError(msg) {
     mainStatus.innerHTML = '<span style="color:#f87171">❌ ' + msg + '</span>';
   }
 
   function haversineKm(lat1, lon1, lat2, lon2) {
-    const R    = 6371;
-    const dLat = deg2rad(lat2 - lat1);
-    const dLon = deg2rad(lon2 - lon1);
-    const a = Math.sin(dLat/2) ** 2 +
-              Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) * Math.sin(dLon/2) ** 2;
+    const R = 6371;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+              Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon/2) * Math.sin(dLon/2);
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   }
 
@@ -651,110 +622,6 @@
     }
 
     return livenessState.events >= LIVENESS_REQUIRED_EVENTS;
-  }
-
-  // random ท่าทางหันซ้าย/ขวา
-  function createRandomChallenge() {
-    const types = ['TURN_LEFT', 'TURN_RIGHT'];
-    const type = types[Math.floor(Math.random() * types.length)];
-    return {
-      type,
-      createdAt: Date.now(),
-      satisfied: false
-    };
-  }
-
-  function getChallengeMessage(challenge) {
-    if (!challenge) return 'มองกล้องตรง ๆ';
-    if (challenge.type === 'TURN_LEFT') {
-      return 'กรุณาหันหน้าไปทางซ้ายช้า ๆ แล้วค้างไว้ชั่วครู่';
-    }
-    if (challenge.type === 'TURN_RIGHT') {
-      return 'กรุณาหันหน้าไปทางขวาช้า ๆ แล้วค้างไว้ชั่วครู่';
-    }
-    return 'มองกล้องตรง ๆ';
-  }
-
-  // เช็คว่าทำท่าทางตาม challenge หรือยัง (ใช้ตำแหน่งจมูกเทียบกับตาทั้งสองข้าง)
-  function checkPoseChallenge(landmarks, challenge) {
-    if (!challenge || challenge.satisfied) return true;
-    if (!landmarks) return false;
-
-    const leftEye  = landmarks.getLeftEye();
-    const rightEye = landmarks.getRightEye();
-    const nose     = landmarks.getNose();
-    if (!leftEye.length || !rightEye.length || !nose.length) return false;
-
-    const eyeCenterX = (leftEye[0].x + rightEye[rightEye.length - 1].x) / 2;
-    const nosePoint  = nose[Math.floor(nose.length / 2)];
-    const diffX      = nosePoint.x - eyeCenterX;
-
-    // เพราะเรากลับภาพด้วย scaleX(-1) ทิศทางจะกลับด้าน
-    const TURN_OFFSET_PX = 10;
-
-    if (challenge.type === 'TURN_LEFT') {
-      // ผู้ใช้หันหน้าไปทางซ้ายของตัวเอง -> ในภาพ (ที่กลับแล้ว) จมูกจะขยับไปทางขวา
-      if (diffX > TURN_OFFSET_PX) {
-        challenge.satisfied = true;
-        return true;
-      }
-      return false;
-    }
-
-    if (challenge.type === 'TURN_RIGHT') {
-      // ผู้ใช้หันหน้าไปทางขวาของตัวเอง -> ในภาพ (ที่กลับแล้ว) จมูกจะขยับไปทางซ้าย
-      if (diffX < -TURN_OFFSET_PX) {
-        challenge.satisfied = true;
-        return true;
-      }
-      return false;
-    }
-
-    return true;
-  }
-
-  // ตรวจจับการกะพริบตาจาก eye aspect ratio
-  function updateBlinkState(landmarks) {
-    if (!landmarks) return false;
-
-    const leftEye  = landmarks.getLeftEye();
-    const rightEye = landmarks.getRightEye();
-    if (!leftEye.length || !rightEye.length) return false;
-
-    const earLeft  = computeEAR(leftEye);
-    const earRight = computeEAR(rightEye);
-    const ear = (earLeft + earRight) / 2;
-
-    if (ear < BLINK_EAR_THRESHOLD) {
-      blinkState.earBelowFrames += 1;
-    } else {
-      if (blinkState.earBelowFrames >= BLINK_MIN_FRAMES) {
-        blinkState.blinkCount += 1;
-      }
-      blinkState.earBelowFrames = 0;
-    }
-
-    return blinkState.blinkCount >= REQUIRED_BLINKS;
-  }
-
-  function computeEAR(eyePoints) {
-    // ใช้สูตร EAR แบบมาตรฐาน จาก 6 จุดของตา
-    // p1-p6 เรียงตามจุดรอบดวงตา
-    const p1 = eyePoints[0];
-    const p2 = eyePoints[1];
-    const p3 = eyePoints[2];
-    const p4 = eyePoints[3];
-    const p5 = eyePoints[4];
-    const p6 = eyePoints[5];
-
-    const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-
-    const vertical1 = dist(p2, p6);
-    const vertical2 = dist(p3, p5);
-    const horizontal = dist(p1, p4);
-
-    if (horizontal === 0) return 0;
-    return (vertical1 + vertical2) / (2.0 * horizontal);
   }
 </script>
 </body>
